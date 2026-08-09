@@ -48,10 +48,15 @@ public:
 
     void getExtractedPoints(std::map<int, std::vector<cv::Point>> &map);
 
+    // Mean-shift centroids of the current mask, in mask coordinates. The
+    // rounded points kept for the next frame are independent from these.
+    void getExtractedSubpixelPoints(std::map<int, std::vector<cv::Point2d>> &map);
+
 private:
     cv::Point2d getSupportCenter(cv::Point2d initialPoint, cv::Mat &img);
 
     std::map<int, std::vector<cv::Point>> _points;
+    std::map<int, std::vector<cv::Point2d>> _subpixelPoints;
     cv::Mat _currMask;
     double _scaling;
     int _radius;

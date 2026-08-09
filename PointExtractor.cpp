@@ -54,8 +54,9 @@ void PointExtractor::run()
     min = 100;
     cv::Range range(min, max + 1);
 
-    std::mt19937 generator{std::random_device{}()};
+    std::mt19937 generator{0};
     std::map<int, std::vector<cv::Point>> new_points;
+    std::map<int, std::vector<cv::Point2d>> new_subpixel_points;
 
     for (int r = range.start; r < range.end; r++)
     {
@@ -65,6 +66,7 @@ void PointExtractor::run()
 
         std::vector<cv::Point> points;
         std::vector<cv::Point> finalPoints;
+        std::vector<cv::Point2d> finalSubpixelPoints;
         cv::findNonZero(idx, points);
 
         if (points.empty())
@@ -118,11 +120,12 @@ void PointExtractor::run()
             {
                 cv::Point p(round(candidate.x), round(candidate.y));
                 finalPoints.push_back(p);
-                cv::circle(idx, p, 20, cv::Scalar({0, 0, 0}), -1);
+                finalSubpixelPoints.push_back(candidate);
+                cv::circle(idx, p, _radius, cv::Scalar({0, 0, 0}), -1);
             }
             else
             {
-                cv::circle(idx, picked, 20, cv::Scalar({0, 0, 0}), -1);
+                cv::circle(idx, picked, _radius, cv::Scalar({0, 0, 0}), -1);
             }
             int nb_deleted = 0;
             std::vector<cv::Point> newPoints = points;
@@ -137,19 +140,13 @@ void PointExtractor::run()
             points = newPoints;
         }
         new_points.insert(std::pair<int, std::vector<cv::Point>>(r, finalPoints));
+        new_subpixel_points.insert(
+            std::pair<int, std::vector<cv::Point2d>>(r, finalSubpixelPoints));
     }
     _hasRun = true;
-    if (_scaling != 1.)
-    {
-        for (auto &pointsId2Vector : new_points)
-        {
-            for (auto &point : pointsId2Vector.second)
-            {
-                point *= _scaling;
-            }
-        }
-    }
+    // The kept points seed the mean shift of the next frame, in mask coordinates.
     _points = new_points;
+    _subpixelPoints = new_subpixel_points;
 }
 
 void PointExtractor::getExtractedPoints(
@@ -158,6 +155,25 @@ void PointExtractor::getExtractedPoints(
     if (!_hasRun && !_currMask.empty())
         run();
     map = _points;
+    if (_scaling != 1.)
+    {
+        for (auto &pointsId2Vector : map)
+        {
+            for (auto &point : pointsId2Vector.second)
+            {
+                point.x = cvRound(point.x * _scaling);
+                point.y = cvRound(point.y * _scaling);
+            }
+        }
+    }
+}
+
+void PointExtractor::getExtractedSubpixelPoints(
+    std::map<int, std::vector<cv::Point2d>> &map)
+{
+    if (!_hasRun && !_currMask.empty())
+        run();
+    map = _subpixelPoints;
 }
 
 cv::Point2d
@@ -172,12 +188,12 @@ PointExtractor::getSupportCenter(cv::Point2d initialPoint, cv::Mat &img)
 
     if (istart < 0)
         istart = 0;
-    if (iend > img.cols)
-        iend = img.cols;
+    if (iend >= img.cols)
+        iend = img.cols - 1;
     if (jstart < 0)
         jstart = 0;
-    if (jend > img.rows)
-        jend = img.rows;
+    if (jend >= img.rows)
+        jend = img.rows - 1;
 
     double ksum = 0;
 
