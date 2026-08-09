@@ -38,7 +38,10 @@ public:
 
 private:
     void normalize(torch::Tensor &inputs, torch::DeviceType deviceType);
-    torch::Tensor convertImagesToInputs(std::vector<cv::Mat> const &imageBatch, torch::DeviceType deviceType);
+    torch::Tensor convertImageToInput(const cv::Mat &rgbImage,
+                                      int targetHeight,
+                                      int targetWidth,
+                                      torch::DeviceType deviceType);
 
     std::shared_ptr<torch::jit::script::Module> _model;
     torch::Tensor _mean;

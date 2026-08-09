@@ -62,6 +62,18 @@ const std::map<int, SoccerPitch3D::LineID> conversionMap = {
     {28, SoccerPitch3D::LineID::R_GOAL_AREA_T_SIDE},   //'Small rect. right top'
 };
 
+static torch::Tensor resizeAntialiased(const torch::Tensor &input, int64_t targetHeight, int64_t targetWidth)
+{
+    namespace F = torch::nn::functional;
+    return F::interpolate(
+        input,
+        F::InterpolateFuncOptions()
+            .size(std::vector<int64_t>{targetHeight, targetWidth})
+            .mode(torch::kBilinear)
+            .align_corners(false)
+            .antialias(true));
+}
+
 void LineSegmentationModel::normalize(torch::Tensor &inputs, torch::DeviceType deviceType)
 {
     if ((!_mean.defined()) || (!_std.defined()))
@@ -94,58 +106,30 @@ void LineSegmentationModel::normalize(torch::Tensor &inputs, torch::DeviceType d
     inputs.sub_(means_).div_(standardDeviations_);
 }
 
-torch::Tensor LineSegmentationModel::convertImagesToInputs(std::vector<cv::Mat> const &imageBatch, torch::DeviceType deviceType)
+torch::Tensor LineSegmentationModel::convertImageToInput(const cv::Mat &rgbImage,
+                                                        int targetHeight,
+                                                        int targetWidth,
+                                                        torch::DeviceType deviceType)
 {
-    if (imageBatch.empty())
-        throw std::invalid_argument("No image supplied");
-    auto batchSize = imageBatch.size();
+    if ((rgbImage.dims != 2) || (rgbImage.channels() != 3) || (rgbImage.type() != CV_8UC3))
+        throw std::invalid_argument("Not an 8-bit RGB image");
 
-    if ((imageBatch[0].dims != 2) || (imageBatch[0].channels() != 3))
-        throw std::invalid_argument("Not a BGR image batch");
-    auto height = imageBatch[0].size[0];
-    auto width = imageBatch[0].size[1];
+    if (!rgbImage.isContinuous())
+        throw std::invalid_argument("Non-contiguous image data");
 
-    auto cvType = imageBatch[0].type();
-    torch::Dtype dataType;
-    switch (cvType)
-    {
-    case CV_8UC3:
-        dataType = torch::kUInt8;
-        break;
+    if ((targetHeight <= 0) || (targetWidth <= 0))
+        throw std::invalid_argument("Invalid target size");
 
-    case CV_32FC3:
-        dataType = torch::kFloat32;
-        break;
+    /* The antialiased resize kernel is only implemented for byte tensors on
+       CPU, so scale down there and transfer the smaller result afterwards */
+    auto byteInput = torch::from_blob(
+                         rgbImage.data,
+                         {1, rgbImage.rows, rgbImage.cols, 3},
+                         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                         .permute({0, 3, 1, 2});
+    auto inputs = resizeAntialiased(byteInput, targetHeight, targetWidth);
 
-    default:
-        throw std::invalid_argument("Unsupported image data type");
-    }
-
-    /* Create tensor of suitable dimensions and data type on target device */
-    std::vector<int64_t> sizes = {(int64_t)batchSize, height, width, 3};
-    auto options = torch::dtype(dataType).device(deviceType).requires_grad(false);
-    auto inputs = torch::empty(sizes, options);
-
-    /* Copy image batch contents to input tensor */
-    int i = 0;
-    for (auto image : imageBatch)
-    {
-        if ((image.dims != 2) ||
-            (image.size[0] != height) ||
-            (image.size[1] != width) ||
-            (image.channels() != 3))
-            throw std::invalid_argument("Inconsistent image batch");
-
-        if (!image.isContinuous())
-            throw std::invalid_argument("Non-contiguous image data");
-
-        std::vector<int64_t> sizes = {height, width, 3};
-        inputs[i++].copy_(torch::from_blob(image.data, sizes, dataType), true);
-    }
-    /* Switch from [B, H, W, C] to [B, C, H, W] format
-     */
-
-    inputs = inputs.permute({0, 3, 1, 2});
+    inputs = inputs.to(deviceType, true);
 
     /* Convert data type as needed */
     inputs = inputs.to(torch::kFloat32, true);
@@ -182,24 +166,24 @@ cv::Mat LineSegmentationModel::computeLineMask(cv::Mat image)
         _model->to(deviceType);
     }
 
-    cv::Mat resized_image;
+    cv::Mat rgb_image;
+    cv::cvtColor(image, rgb_image, cv::COLOR_BGR2RGB);
+
     int new_height;
     int new_width;
 
-    if (image.rows > image.cols)
+    if (rgb_image.rows > rgb_image.cols)
     {
         new_width = 256;
-        new_height = static_cast<int>(256.0 * image.rows / image.cols);
+        new_height = static_cast<int>(256.0 * rgb_image.rows / rgb_image.cols);
     }
     else
     {
         new_height = 256;
-        new_width = static_cast<int>(256.0 * image.cols / image.rows);
+        new_width = static_cast<int>(256.0 * rgb_image.cols / rgb_image.rows);
     }
-    cv::resize(image, resized_image, cv::Size(new_width, new_height));
 
-    std::vector<cv::Mat> imageBatch = {resized_image};
-    auto inputs = convertImagesToInputs(imageBatch, deviceType);
+    auto inputs = convertImageToInput(rgb_image, new_height, new_width, deviceType);
     std::vector<torch::IValue> inputValues;
     inputValues.push_back(inputs.toType(torch::kFloat32));
 
