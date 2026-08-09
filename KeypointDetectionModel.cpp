@@ -84,8 +84,9 @@ KeypointDetectionModel::KeypointDetectionModel(std::string model_path)
 
 ChannelKeypoints KeypointDetectionModel::getKeypointsFromHeatmapBatchMaxpool(
     const torch::Tensor &heatmap,
-    int scale = 2,
-    int maxKeypoints = 2,
+    double scaleX,
+    double scaleY,
+    int maxKeypoints = 1,
     int minKeypointPixelDistance = 15,
     bool returnScores = true)
 {
@@ -120,15 +121,10 @@ ChannelKeypoints KeypointDetectionModel::getKeypointsFromHeatmapBatchMaxpool(
     torch::Tensor scores = std::get<0>(topkResult);  // Scores
     torch::Tensor indices = std::get<1>(topkResult); // Indices
 
-    // Calculate (x, y) coordinates for indices
-    torch::Tensor x = indices % width;
-    torch::Tensor y = indices / width;
-    torch::Tensor coords = torch::stack({x, y}, -1);
-
     // Move data to CPU and convert to standard containers
-    auto coordsCpu = coords.to(torch::kCPU).contiguous();
+    auto indicesCpu = indices.to(torch::kCPU).contiguous();
     auto scoresCpu = scores.to(torch::kCPU).contiguous();
-    auto coordsAccessor = coordsCpu.accessor<float, 4>();
+    auto indicesAccessor = indicesCpu.accessor<int64_t, 3>();
     auto scoresAccessor = scoresCpu.accessor<float, 3>();
 
     // Prepare output container
@@ -141,16 +137,17 @@ ChannelKeypoints KeypointDetectionModel::getKeypointsFromHeatmapBatchMaxpool(
         {
             for (int k = 0; k < maxKeypoints; ++k)
             {
-                float x = coordsAccessor[b][c][k][0];
-                float y = coordsAccessor[b][c][k][1];
+                const int64_t flatIndex = indicesAccessor[b][c][k];
+                const int64_t x = flatIndex % width;
+                const int64_t y = flatIndex / width;
                 float score = scoresAccessor[b][c][k];
                 if (returnScores)
                 {
-                    output[b][c].emplace_back(std::tuple(round(x * scale), round(y * scale), score));
+                    output[b][c].emplace_back(std::tuple(round(x * scaleX), round(y * scaleY), score));
                 }
                 else
                 {
-                    output[b][c].emplace_back(std::tuple(round(x * scale), round(y * scale), 0.0f));
+                    output[b][c].emplace_back(std::tuple(round(x * scaleX), round(y * scaleY), 0.0f));
                 }
             }
         }
@@ -172,7 +169,7 @@ void KeypointDetectionModel::retrieveSemanticPoints(ChannelKeypoints detectedPoi
 
         for (Keypoint &kp : detectedPoints[c])
         {
-            if (std::get<2>(kp) > 0.1)
+            if (std::get<2>(kp) > 0.1449)
             {
                 Point2D point(
                     std::get<0>(kp),
@@ -257,20 +254,8 @@ void KeypointDetectionModel::computeKeypoints(const cv::Mat &image,
         _model->to(deviceType);
     }
     cv::Mat resized_image;
-    int new_height;
-    int new_width;
-    int smaller_dim = 540;
-    if (image.rows > image.cols)
-    {
-        new_width = smaller_dim;
-        new_height = static_cast<int>(smaller_dim * image.rows / image.cols);
-    }
-    else
-    {
-        new_height = smaller_dim;
-        new_width = static_cast<int>(smaller_dim * image.cols / image.rows);
-    }
-    cv::resize(image, resized_image, cv::Size(new_width, new_height));
+    cv::resize(image, resized_image, cv::Size(960, 540));
+    cv::cvtColor(resized_image, resized_image, cv::COLOR_BGR2RGB);
 
     std::vector<cv::Mat> imageBatch = {resized_image};
     auto inputs = convertImagesToInputs(imageBatch, deviceType);
@@ -283,7 +268,10 @@ void KeypointDetectionModel::computeKeypoints(const cv::Mat &image,
     // Detach, squeeze, and find the argmax along dimension 0
     result = result.detach();
     result = result.to(torch::kCPU);
-    auto keypoints = getKeypointsFromHeatmapBatchMaxpool(result);
+    const double scaleX = static_cast<double>(image.cols) / result.size(3);
+    const double scaleY = static_cast<double>(image.rows) / result.size(2);
+    result = result.narrow(1, 0, result.size(1) - 1);
+    auto keypoints = getKeypointsFromHeatmapBatchMaxpool(result, scaleX, scaleY);
 
     retrieveSemanticPoints(keypoints, outPointDict);
 }

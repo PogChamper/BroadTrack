@@ -44,7 +44,8 @@ public:
 
 private:
     ChannelKeypoints getKeypointsFromHeatmapBatchMaxpool(const torch::Tensor &heatmap,
-                                                         int scale,
+                                                         double scaleX,
+                                                         double scaleY,
                                                          int maxKeypoints,
                                                          int minKeypointPixelDistance,
                                                          bool returnScores);
