@@ -33,6 +33,12 @@ broadtrack --f <image folder> --o <output json file> --t <tripod file>
 ```
 
 
+## Reproducing the paper results
+This branch fixes a number of bugs in the released code that kept it from
+reproducing the paper's SoccerNet-GSR numbers. See [FIXES.md](FIXES.md) for
+what was broken and for step-by-step instructions.
+
+
 ## Estimating the camera tripod parameters
 First run BroadTrack with default camera parameters from common priors:  
 | Camera type | X   | Y   | Z   |
