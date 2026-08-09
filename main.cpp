@@ -43,6 +43,7 @@ namespace fs = boost::filesystem;
 namespace po = boost::program_options;
 
 #include <fstream>
+#include <algorithm>
 #include <string>
 #include "rapidjson/document.h"
 #include "rapidjson/istreamwrapper.h"
@@ -239,12 +240,21 @@ int main(int argc, char *argv[])
         auto topLeftPitchCorner = soccerPitch3D.getPoint2D(SoccerPitch3D::TL_PITCH_CORNER);
         auto bottomRightPitchCorner = soccerPitch3D.getPoint2D(SoccerPitch3D::BR_PITCH_CORNER);
 
-        std::string seqStr = args.frames_directory; 
         fs::path sequence(args.frames_directory);
-        int frames_number = std::count_if(
-            fs::directory_iterator(sequence),
-            fs::directory_iterator(),
-            static_cast<bool (*)(const fs::path &)>(fs::is_regular_file));
+        std::vector<fs::path> framePaths;
+        for (const auto &entry : boost::make_iterator_range(fs::directory_iterator(sequence), fs::directory_iterator()))
+        {
+            if (fs::is_regular_file(entry.path()) && entry.path().extension() == ".jpg")
+            {
+                framePaths.push_back(entry.path());
+            }
+        }
+        std::sort(framePaths.begin(), framePaths.end());
+        if (framePaths.empty())
+        {
+            std::cerr << "No .jpg frames found in " << sequence << std::endl;
+            continue;
+        }
 
         CameraTracker tracker;
         LineSegmentationModel lineDetector(args.tvcalib,
@@ -253,7 +263,7 @@ int main(int argc, char *argv[])
 
         KeypointDetectionModel keypointDetector(args.keypoints);
 
-        fs::path img_path = sequence / "000001.jpg"; 
+        fs::path img_path = framePaths.front();
         cv::Mat cv_img = cv::imread(img_path.string());
         int image_width = cv_img.cols;
         int image_height = cv_img.rows;
@@ -322,22 +332,25 @@ int main(int argc, char *argv[])
         std::vector<cv::Point2f> p0, p1;
 
         int nb_frames_tracking_lost = 0;
-        for (int i = 1; i < frames_number; i++)
+        const fs::path humanBboxesDirectory = args.human_bboxes_directory.empty()
+                                              ? sequence / "human-bboxes"
+                                              : fs::path(args.human_bboxes_directory);
+
+        for (size_t frameIndex = 0; frameIndex < framePaths.size(); ++frameIndex)
         {
             auto cam0 = tracker.getCamera();
             Camera cam;
             double score; // = tracker.evaluate(mask);
             bool reinit = false;
 
-            std::ostringstream oss;
-            oss << std::setw(6) << std::setfill('0') << i; 
-            std::string frame_path = "/" + oss.str() + ".jpg";
-            std::string full_img_path = seqStr + frame_path; 
+            const fs::path currentFramePath = framePaths[frameIndex];
+            const std::string frame_path = "/" + currentFramePath.filename().string();
+            const std::string full_img_path = currentFramePath.string();
 
             std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> pointDict;
 
-            std::string full_output_img_path = output_img_dir.generic_string() + "t_" + frame_path;
-            std::string full_human_bboxes_path = seqStr + "/human-bboxes/" + oss.str() + ".json";
+            const std::string full_output_img_path = (output_img_dir / ("t_" + currentFramePath.filename().string())).string();
+            const std::string full_human_bboxes_path = (humanBboxesDirectory / (currentFramePath.stem().string() + ".json")).string();
 
             cv::Mat currentCVFrame = cv::imread(full_img_path);
             if (currentCVFrame.empty())
@@ -358,7 +371,7 @@ int main(int argc, char *argv[])
             std::vector<std::pair<Point3D, Point2D>> pitchProjections;
             if (conf.opticalFlow && !nb_frames_tracking_lost)
             {
-                if (i == 1)
+                if (frameIndex == 0)
                 {
 
                     for (int row = 50; row < image_height - 50; row += 50)
@@ -369,7 +382,7 @@ int main(int argc, char *argv[])
                         }
                     }
                 }
-                else if (i > 1)
+                else
                 {
                     opticalFlowTimer.tic();
                     cv::Mat curr;
@@ -437,7 +450,7 @@ int main(int argc, char *argv[])
                 std::cerr << "Wrong config mode: unknown positionMode " << conf.positionMode << std::endl;
             }
 
-            if (score < 0.3)
+            if (score < CameraTracker::REINIT_SCORE_THRESHOLD)
             {
                 nb_frames_tracking_lost += 1;
                 std::cout << "Reinit needed " << std::endl;
@@ -472,11 +485,10 @@ int main(int argc, char *argv[])
                 }
                 else if (conf.positionMode == "free")
                 {
-
-                    std::tie(score, cam) = tracker.update(mask, empty, true, false, conf.radial_distortion, 100 * nb_frames_tracking_lost);
+                    std::tie(score, cam) = tracker.update(mask, empty, false, false, conf.radial_distortion, 100 * nb_frames_tracking_lost);
                 }
             }
-            if (score > 0.5)
+            if (score >= CameraTracker::REINIT_SCORE_THRESHOLD)
             {
                 nb_frames_tracking_lost = 0;
             }
@@ -490,9 +502,10 @@ int main(int argc, char *argv[])
                 cv::Mat bgr = currentCVFrame.clone();
                 cv::Mat cvResized;
                 cv::resize(bgr, cvResized, cv::Size(), scale, scale);
-                cam.setPixelResolution(cv::Size(cvResized.cols, cvResized.rows));
-                cam.setFocalLength(cam.getFocalLength() * scale);
-                cam.drawWireframe(soccerPitch3D, cvResized, cv::Scalar(255, 0, 0));
+                Camera visualizationCamera = cam;
+                visualizationCamera.setPixelResolution(cv::Size(cvResized.cols, cvResized.rows));
+                visualizationCamera.setFocalLength(visualizationCamera.getFocalLength() * scale);
+                visualizationCamera.drawWireframe(soccerPitch3D, cvResized, cv::Scalar(255, 0, 0));
                 cv::imwrite(full_output_img_path, cvResized);
             }
 
