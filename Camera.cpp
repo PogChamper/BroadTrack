@@ -454,12 +454,32 @@ bool Camera::undistort(const Point2D &distortedNormalizedImageCoordinates, Point
 {
     normalizedImageCoordinates = distortedNormalizedImageCoordinates;
 
-    double squaredDistortedRadius = 0.0;
+    const double squaredDistortedRadius = distortedNormalizedImageCoordinates.squaredNorm();
 
-    if (!_correctionCoefficients.empty())
+    if (!_distortionCoefficients.empty())
     {
-        squaredDistortedRadius = distortedNormalizedImageCoordinates.squaredNorm();
+        // The forward radial model has no closed form inverse, invert it iteratively.
+        for (int iteration = 0; iteration < 10; iteration++)
+        {
+            const double squaredRadius = normalizedImageCoordinates.squaredNorm();
 
+            double distortion = 1.0;
+
+            for (int k = 0; k < _distortionCoefficients.size(); k++)
+            {
+                distortion += _distortionCoefficients[k] * pow(squaredRadius, k + 1);
+            }
+
+            if (fabs(distortion) < 1e-12)
+            {
+                return false;
+            }
+
+            normalizedImageCoordinates = distortedNormalizedImageCoordinates / distortion;
+        }
+    }
+    else if (!_correctionCoefficients.empty())
+    {
         double correction = 1.0;
 
         for (int k = 0; k < _correctionCoefficients.size(); k++)
