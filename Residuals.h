@@ -29,6 +29,7 @@
 #include "Camera.h"
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
+#include <cmath>
 
 struct FixedPointReprojectionError
 {
@@ -185,6 +186,8 @@ struct CameraSoftConstraintResidual
 
 struct CameraSoftOpticalAxisConstraintResidual
 {
+    static constexpr double MINIMUM_NORMALIZATION_RADIUS = 1.0e-12;
+
     CameraSoftOpticalAxisConstraintResidual(const Point3D &tripodRotationCenter, double offsetToSensor)
         : _tripod(tripodRotationCenter.hx(), tripodRotationCenter.hy(), tripodRotationCenter.hz())
     {
@@ -209,7 +212,19 @@ struct CameraSoftOpticalAxisConstraintResidual
 
         Eigen::Vector3<T> t = cameraEye + lookAt.dot(eyeToTripodVector) / lookAt.dot(lookAt) * lookAt;
 
-        residuals[0] = _radius - (t - _tripod).squaredNorm();
+        const T squaredDistance = (t - _tripod.cast<T>()).squaredNorm();
+
+        // Same zero set and local scale as radius - distance, without the
+        // square root derivative at zero. The normalization is undefined for a
+        // zero radius, where the squared distance already has the right zero.
+        if (std::abs(_radius) <= MINIMUM_NORMALIZATION_RADIUS)
+        {
+            residuals[0] = squaredDistance;
+        }
+        else
+        {
+            residuals[0] = (squaredDistance - T(_radius * _radius)) / T(2.0 * _radius);
+        }
 
         return true;
     }
