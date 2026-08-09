@@ -27,9 +27,169 @@
 #include "CameraTracker.h"
 #include "Residuals.h"
 #include "LineIoUScore.h"
-#include <random>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
 
 const double MASK_TO_HD_FACTOR = 2.0;
+
+namespace
+{
+constexpr double NUMERICAL_EPSILON = 1.0e-12;
+constexpr double ROOT_DUPLICATE_RELATIVE_TOLERANCE = 1.0e-9;
+
+struct ReprojectionEvaluation
+{
+    size_t validCount = 0;
+    size_t inlierCount = 0;
+    double inlierMean = std::numeric_limits<double>::infinity();
+    double truncatedMean = 0.0;
+};
+
+struct HypothesisEvaluation
+{
+    ReprojectionEvaluation reprojection;
+    size_t firstPointId = std::numeric_limits<size_t>::max();
+    size_t secondPointId = std::numeric_limits<size_t>::max();
+    bool isBaseline = false;
+};
+
+bool isFinite(const Point2D &point)
+{
+    return std::isfinite(point.w()) &&
+           std::abs(point.w()) > NUMERICAL_EPSILON &&
+           std::isfinite(point.x()) &&
+           std::isfinite(point.y());
+}
+
+bool isFinite(const Point3D &point)
+{
+    return std::isfinite(point.w()) &&
+           std::abs(point.w()) > NUMERICAL_EPSILON &&
+           std::isfinite(point.x()) &&
+           std::isfinite(point.y()) &&
+           std::isfinite(point.z());
+}
+
+bool findClosestFiniteObservation(const Point2D &projectedPoint,
+                                  const std::vector<Point2D> &observations,
+                                  Point2D &closestObservation,
+                                  double &closestDistance)
+{
+    closestDistance = std::numeric_limits<double>::infinity();
+    bool found = false;
+    for (const auto &observation : observations)
+    {
+        if (!isFinite(observation))
+        {
+            continue;
+        }
+
+        const double distance = projectedPoint.distance(observation);
+        if (std::isfinite(distance) && distance < closestDistance)
+        {
+            closestDistance = distance;
+            closestObservation = observation;
+            found = true;
+        }
+    }
+    return found;
+}
+
+ReprojectionEvaluation evaluateReprojections(
+    const SoccerPitch3D &soccerPitch,
+    const std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> &points,
+    int threshold,
+    std::vector<bool> &outInliers,
+    const Camera &camera)
+{
+    outInliers.assign(points.size(), false);
+
+    ReprojectionEvaluation evaluation;
+    const double truncation = std::max(1.0, static_cast<double>(threshold));
+    double truncatedErrorSum = 0.0;
+    double inlierErrorSum = 0.0;
+
+    for (size_t pointIndex = 0; pointIndex < points.size(); ++pointIndex)
+    {
+        double error = truncation;
+        Point2D projectedPoint;
+        const Point3D worldPoint = soccerPitch.getPoint3D(points[pointIndex].first);
+        const bool validProjection = isFinite(worldPoint) &&
+                                     camera.project(worldPoint, projectedPoint, true) &&
+                                     isFinite(projectedPoint);
+
+        if (validProjection)
+        {
+            Point2D closestObservation;
+            double closestDistance;
+            if (findClosestFiniteObservation(projectedPoint,
+                                             points[pointIndex].second,
+                                             closestObservation,
+                                             closestDistance))
+            {
+                ++evaluation.validCount;
+                error = closestDistance;
+                if (closestDistance <= static_cast<double>(threshold))
+                {
+                    outInliers[pointIndex] = true;
+                    ++evaluation.inlierCount;
+                    inlierErrorSum += closestDistance;
+                }
+            }
+        }
+
+        truncatedErrorSum += std::min(error, truncation);
+    }
+
+    evaluation.truncatedMean = points.empty()
+                                   ? truncation
+                                   : truncatedErrorSum / points.size();
+    if (evaluation.inlierCount > 0)
+    {
+        evaluation.inlierMean = inlierErrorSum / evaluation.inlierCount;
+    }
+    return evaluation;
+}
+
+bool isBetterHypothesis(const HypothesisEvaluation &candidate,
+                        const HypothesisEvaluation &reference)
+{
+    if (candidate.reprojection.inlierCount != reference.reprojection.inlierCount)
+    {
+        return candidate.reprojection.inlierCount > reference.reprojection.inlierCount;
+    }
+    if (candidate.reprojection.inlierMean != reference.reprojection.inlierMean)
+    {
+        return candidate.reprojection.inlierMean < reference.reprojection.inlierMean;
+    }
+    if (candidate.reprojection.truncatedMean != reference.reprojection.truncatedMean)
+    {
+        return candidate.reprojection.truncatedMean < reference.reprojection.truncatedMean;
+    }
+
+    // Prefer the current camera on an exact tie. Pair IDs make ties between
+    // generated hypotheses independent of iteration order.
+    if (candidate.isBaseline != reference.isBaseline)
+    {
+        return candidate.isBaseline;
+    }
+    if (candidate.firstPointId != reference.firstPointId)
+    {
+        return candidate.firstPointId < reference.firstPointId;
+    }
+    return candidate.secondPointId < reference.secondPointId;
+}
+} // namespace
+
+// Map a pixel center of the source resolution onto the pixel center of the
+// target resolution, with independent horizontal and vertical scales.
+cv::Point2d mapPixelCenter(const cv::Point2d &point, const cv::Size &sourceResolution, const cv::Size &targetResolution)
+{
+    return cv::Point2d((point.x + 0.5) * targetResolution.width / sourceResolution.width - 0.5,
+                       (point.y + 0.5) * targetResolution.height / sourceResolution.height - 0.5);
+}
 
 Point3D closestPointOnSegment(const Point3D &P, const Point3D &A, const Point3D &B)
 {
@@ -87,8 +247,16 @@ std::tuple<double, Camera> CameraTracker::update(const cv::Mat &semLinesMask,
     Point2D principalPoint = _camera.getPrincipalPoint();
 
     _pointExtractor.setMask(semLinesMask);
-    std::map<int, std::vector<cv::Point>> soccerLineMatches;
-    _pointExtractor.getExtractedPoints(soccerLineMatches);
+    std::map<int, std::vector<cv::Point2d>> soccerLineMatches;
+    _pointExtractor.getExtractedSubpixelPoints(soccerLineMatches);
+    const cv::Size cameraResolution = _camera.getPixelResolution();
+    for (auto &labeledLine : soccerLineMatches)
+    {
+        for (auto &point : labeledLine.second)
+        {
+            point = mapPixelCenter(point, semLinesMask.size(), cameraResolution);
+        }
+    }
 
     ceres::Problem problem;
 
@@ -140,7 +308,7 @@ std::tuple<double, Camera> CameraTracker::update(const cv::Mat &semLinesMask,
         for (const auto &curvePoint : curveSample)
         {
             auto point3D = _soccerPitch3D.getSurface().intersection(
-                _camera.getRay(Point2D(curvePoint.x * MASK_TO_HD_FACTOR, curvePoint.y * MASK_TO_HD_FACTOR)));
+                _camera.getRay(Point2D(curvePoint.x, curvePoint.y)));
             auto t = getCurveParameter(point3D, polyLine3D);
             curvePointParameterData[lineId].emplace_back(t);
         }
@@ -153,7 +321,7 @@ std::tuple<double, Camera> CameraTracker::update(const cv::Mat &semLinesMask,
 
         for (int i = 0; i < curveSample.size(); i++)
         {
-            auto curvePoint = Point2D(curveSample[i].x * MASK_TO_HD_FACTOR, curveSample[i].y * MASK_TO_HD_FACTOR);
+            auto curvePoint = Point2D(curveSample[i].x, curveSample[i].y);
             ceres::CostFunction *reprojectionCostFunction =
                 CurvePointReprojectionError::createCostFunction(polyLine3D, curvePoint - principalPoint);
             problem.AddResidualBlock(reprojectionCostFunction,
@@ -245,84 +413,136 @@ std::tuple<double, double> CameraTracker::evaluateReprojectionError(const std::v
                                                                     std::vector<bool> &outInliers,
                                                                     const Camera &camera)
 {
-    std::vector<double> errors;
-    std::vector<double> inlierErrors;
-    auto inlier = outInliers.begin();
-    for (auto pointCorrespondence = points.begin(); pointCorrespondence != points.end() && inlier != outInliers.end(); pointCorrespondence++, inlier++)
+    const ReprojectionEvaluation evaluation = evaluateReprojections(
+        _soccerPitch3D, points, threshold, outInliers, camera);
+    return std::make_tuple(evaluation.truncatedMean, evaluation.inlierMean);
+}
+
+void appendDistinctPositiveRoot(std::vector<double> &roots, double root)
+{
+    if (!std::isfinite(root) || root <= NUMERICAL_EPSILON)
     {
-        Point3D worldPitchPoint = _soccerPitch3D.getPoint3D(pointCorrespondence->first);
-        Point2D imagePoint;
-        camera.project(worldPitchPoint, imagePoint);
-        int len = pointCorrespondence->second.size();
-        if (len == 1)
+        return;
+    }
+
+    for (const double existingRoot : roots)
+    {
+        const double scale = std::max(1.0, std::max(std::abs(root), std::abs(existingRoot)));
+        if (std::abs(root - existingRoot) <= ROOT_DUPLICATE_RELATIVE_TOLERANCE * scale)
         {
-            double pixelDistance = imagePoint.distance(pointCorrespondence->second[0]);
-            errors.push_back(pixelDistance);
-            if (pixelDistance <= threshold)
-            {
-                *inlier = true;
-                inlierErrors.push_back(pixelDistance);
-            }
-            else
-            {
-                *inlier = false;
-            }
+            return;
         }
     }
-    double mean = std::accumulate(errors.begin(), errors.end(), 0.0) / errors.size();
-    double inlierError = std::accumulate(inlierErrors.begin(), inlierErrors.end(), 0.0) / inlierErrors.size();
-
-    return std::tuple<double, double>(mean, inlierError);
+    roots.push_back(root);
 }
 
-double focalLengthFromTwoPoints(double a, double b, double c, double d)
+std::vector<double> squaredFocalLengthFromTwoPoints(double a, double b, double c, double d)
 {
-
-    double c_2 = pow(c, 2);
-    double d_2 = pow(d, 2);
-    double t1 = 2 * (d_2 * a * b - c_2);
-    double t2 = pow(d_2 * (a + b) - 2 * c, 2) - 4 * (d_2 * a * b - c_2) * (d_2 - 1);
-
-    double f = 1;
-    if (t2 <= 0)
-        return f;
-    assert(t2 >= 0);
-    double t3 = 2 * c - d_2 * (a + b) + sqrt(t2);
-
-    if (t3 == 0)
-        return f;
-    assert(t3 != 0);
-
-    double f2 = t1 / t3;
-    if (f2 > 1)
-        f = sqrt(f2);
-
-    return f;
-}
-
-double estimateFocalLengthFromPositionAndTwoPoints(const std::vector<std::pair<Point3D, Point2D>> &points, Point3D position)
-{
-    Point3D X1 = points[0].first - position;
-    X1.scale(1 / X1.norm());
-    Point3D X2 = points[1].first - position;
-    X2.scale(1 / X2.norm());
-    double d = X1.dotProduct(X2) - 1;
-
-    Point2D x1 = points[0].second;
-    x1.scale(1. / 1080.);
-    Point2D x2 = points[1].second;
-    x2.scale(1. / 1080.);
-
-    double a = x1.dotProduct(x1) - 1;
-    double b = x2.dotProduct(x2) - 1;
-    double c = x1.dotProduct(x2) - 1;
-
-    double f = focalLengthFromTwoPoints(a, b, c, d);
-    if (f > 1)
+    std::vector<double> roots;
+    if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c) || !std::isfinite(d))
     {
-        return f * 1080;
+        return roots;
     }
-    return f;
+
+    const double dSquared = d * d;
+    const double A = dSquared - 1.0;
+    const double B = dSquared * (a + b) - 2.0 * c;
+    const double C = dSquared * a * b - c * c;
+    if (!std::isfinite(A) || !std::isfinite(B) || !std::isfinite(C))
+    {
+        return roots;
+    }
+
+    const double coefficientScale = std::max(1.0, std::max(std::abs(A), std::max(std::abs(B), std::abs(C))));
+    if (std::abs(A) <= NUMERICAL_EPSILON * coefficientScale)
+    {
+        // |d| ~= 1 means the two world rays do not constrain focal length.
+        return roots;
+    }
+
+    double discriminant = B * B - 4.0 * A * C;
+    const double discriminantScale = std::max(1.0, std::max(B * B, std::abs(4.0 * A * C)));
+    if (!std::isfinite(discriminant) || discriminant < -NUMERICAL_EPSILON * discriminantScale)
+    {
+        return roots;
+    }
+    discriminant = std::max(0.0, discriminant);
+
+    const double squareRootDiscriminant = std::sqrt(discriminant);
+    const double q = -0.5 * (B + std::copysign(squareRootDiscriminant, B));
+    if (std::abs(q) > NUMERICAL_EPSILON * coefficientScale)
+    {
+        appendDistinctPositiveRoot(roots, q / A);
+        appendDistinctPositiveRoot(roots, C / q);
+    }
+    else if (std::abs(B) > NUMERICAL_EPSILON * coefficientScale)
+    {
+        // Numerically repeated root; q would divide by zero.
+        appendDistinctPositiveRoot(roots, -B / (2.0 * A));
+    }
+
+    std::sort(roots.begin(), roots.end());
+    return roots;
+}
+
+std::vector<double> estimateFocalLengthsFromPositionAndTwoPoints(const std::vector<std::pair<Point3D, Point2D>> &points, const Point3D &position,
+                                                                 const Point2D &principalPoint, const cv::Size &resolution)
+{
+    std::vector<double> focalLengths;
+    if (points.size() != 2 || !isFinite(position) || !isFinite(principalPoint) || resolution.width <= 0 || resolution.height <= 0 ||
+        !isFinite(points[0].first) || !isFinite(points[1].first) || !isFinite(points[0].second) || !isFinite(points[1].second))
+    {
+        return focalLengths;
+    }
+
+    Point3D X1 = points[0].first - position;
+    Point3D X2 = points[1].first - position;
+    const double firstRayNorm = X1.norm();
+    const double secondRayNorm = X2.norm();
+    if (!std::isfinite(firstRayNorm) || !std::isfinite(secondRayNorm) || firstRayNorm <= NUMERICAL_EPSILON || secondRayNorm <= NUMERICAL_EPSILON)
+    {
+        return focalLengths;
+    }
+    X1.scale(1.0 / firstRayNorm);
+    X2.scale(1.0 / secondRayNorm);
+    double d = X1.dotProduct(X2) - 1.0;
+    if (!std::isfinite(d) || std::abs(d) > 1.0 + NUMERICAL_EPSILON || 1.0 - std::abs(d) <= NUMERICAL_EPSILON)
+    {
+        return focalLengths;
+    }
+    d = std::max(-1.0, std::min(1.0, d));
+
+    // The closed-form solver works in principal-centred image coordinates
+    // normalized by the current image height.
+    const double normalizationScale = static_cast<double>(resolution.height);
+    const Point2D x1 = (points[0].second - principalPoint) / normalizationScale;
+    const Point2D x2 = (points[1].second - principalPoint) / normalizationScale;
+    if (x1.distance(x2) <= NUMERICAL_EPSILON)
+    {
+        return focalLengths;
+    }
+
+    const double a = x1.dotProduct(x1) - 1.0;
+    const double b = x2.dotProduct(x2) - 1.0;
+    const double c = x1.dotProduct(x2) - 1.0;
+
+    // Keep the roots within a broad 5..150 degree horizontal field of view.
+    constexpr double PI = 3.14159265358979323846;
+    const double minimumHorizontalFieldOfView = 5.0 * PI / 180.0;
+    const double maximumHorizontalFieldOfView = 150.0 * PI / 180.0;
+    const double minimumFocalLength = resolution.width / (2.0 * std::tan(maximumHorizontalFieldOfView / 2.0));
+    const double maximumFocalLength = resolution.width / (2.0 * std::tan(minimumHorizontalFieldOfView / 2.0));
+
+    const std::vector<double> squaredNormalizedFocalLengths = squaredFocalLengthFromTwoPoints(a, b, c, d);
+    for (const double squaredNormalizedFocalLength : squaredNormalizedFocalLengths)
+    {
+        const double focalLength = std::sqrt(squaredNormalizedFocalLength) * normalizationScale;
+        if (std::isfinite(focalLength) && focalLength >= minimumFocalLength && focalLength <= maximumFocalLength)
+        {
+            focalLengths.push_back(focalLength);
+        }
+    }
+    return focalLengths;
 }
 
 std::tuple<double, double> CameraTracker::estimatePanTilt(const std::vector<std::pair<Point3D, Point2D>> &detectedPoints,
@@ -331,22 +551,48 @@ std::tuple<double, double> CameraTracker::estimatePanTilt(const std::vector<std:
                                                           size_t iwidth,
                                                           size_t iheight)
 {
+    const double invalidAngle = std::numeric_limits<double>::quiet_NaN();
+    if (detectedPoints.empty() || !std::isfinite(focal) || focal <= 0.0 || !isFinite(position))
+    {
+        return std::make_tuple(invalidAngle, invalidAngle);
+    }
+
+    const cv::Size currentResolution = _camera.getPixelResolution();
+    if (currentResolution.width != static_cast<int>(iwidth) || currentResolution.height != static_cast<int>(iheight))
+    {
+        return std::make_tuple(invalidAngle, invalidAngle);
+    }
+
     Point3D mean_optical_axis(0., 0., 0.);
     for (auto &point : detectedPoints)
     {
+        if (!isFinite(point.first) || !isFinite(point.second))
+        {
+            return std::make_tuple(invalidAngle, invalidAngle);
+        }
         Point3D P = point.first - position;
         mean_optical_axis = mean_optical_axis + P;
     }
 
-    mean_optical_axis.scale(1 / mean_optical_axis.norm());
+    const double opticalAxisNorm = mean_optical_axis.norm();
+    if (!std::isfinite(opticalAxisNorm) || opticalAxisNorm <= NUMERICAL_EPSILON)
+    {
+        return std::make_tuple(invalidAngle, invalidAngle);
+    }
+    mean_optical_axis.scale(1.0 / opticalAxisNorm);
     double curr_pan = atan2(mean_optical_axis[0], -mean_optical_axis[1]);
     double curr_tilt = atan2(-mean_optical_axis[1], mean_optical_axis[2]);
+    if (!std::isfinite(curr_pan) || !std::isfinite(curr_tilt))
+    {
+        return std::make_tuple(invalidAngle, invalidAngle);
+    }
 
-    Camera camera;
+    // Copy the current camera so that distortion, resolution and every other
+    // non-pose attribute survive the estimation.
+    Camera camera = _camera;
 
     camera.setPanTiltRoll(Vector3x1(curr_pan, curr_tilt, 0.))
         .setPosition(Vector3x1(position.x(), position.y(), position.z()))
-        .setPrincipalPoint(Point2D(iwidth / 2., iheight / 2.))
         .setFocalLength(focal);
 
     for (int i = 0; i < 5; i++)
@@ -356,11 +602,19 @@ std::tuple<double, double> CameraTracker::estimatePanTilt(const std::vector<std:
         for (auto &point : detectedPoints)
         {
             Point2D projected;
-            camera.project(point.first, projected);
+            camera.project(point.first, projected, false);
+            if (!isFinite(projected))
+            {
+                return std::make_tuple(invalidAngle, invalidAngle);
+            }
             double dx = point.second.x() - projected.x();
             double dy = projected.y() - point.second.y();
             double dpan = atan2(dx, focal);
             double dtilt = atan2(dy, focal);
+            if (!std::isfinite(dpan) || !std::isfinite(dtilt))
+            {
+                return std::make_tuple(invalidAngle, invalidAngle);
+            }
             pans.push_back(dpan);
             tilts.push_back(dtilt);
         }
@@ -368,10 +622,13 @@ std::tuple<double, double> CameraTracker::estimatePanTilt(const std::vector<std:
         curr_pan -= meanPan;
         double meanTilt = std::accumulate(tilts.begin(), tilts.end(), 0.0) / tilts.size();
         curr_tilt -= meanTilt;
+        if (!std::isfinite(curr_pan) || !std::isfinite(curr_tilt))
+        {
+            return std::make_tuple(invalidAngle, invalidAngle);
+        }
 
         camera.setPanTiltRoll(Vector3x1(curr_pan, curr_tilt, 0.))
             .setPosition(Vector3x1(position.x(), position.y(), position.z()))
-            .setPrincipalPoint(Point2D(iwidth / 2., iheight / 2.))
             .setFocalLength(focal);
     }
 
@@ -380,94 +637,121 @@ std::tuple<double, double> CameraTracker::estimatePanTilt(const std::vector<std:
 
 void CameraTracker::reinit(const std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> &detectedPoints, int threshold, int n_iterations)
 {
-    std::vector<bool> outInliers(detectedPoints.size(), false);
-
-    double meanReprojectionError, inlierError;
-    std::tie(meanReprojectionError, inlierError) = this->evaluateReprojectionError(detectedPoints, threshold, outInliers, _camera);
-    if (meanReprojectionError < threshold || detectedPoints.size() < 2)
+    if (detectedPoints.size() < 2 || n_iterations == 0)
     {
         return;
     }
 
-    std::default_random_engine generator;
-    std::uniform_int_distribution<int> distribution(0, detectedPoints.size() - 1);
-    double bestError = meanReprojectionError;
+    std::vector<bool> outInliers;
+    HypothesisEvaluation bestEvaluation;
+    bestEvaluation.reprojection = evaluateReprojections(_soccerPitch3D, detectedPoints, threshold, outInliers, _camera);
+    bestEvaluation.isBaseline = true;
     Camera bestCamera = _camera;
-    cv::Size resolution = _camera.getPixelResolution();
+    const cv::Size resolution = _camera.getPixelResolution();
+    const Point2D principalPoint = _camera.getPrincipalPoint();
 
-    for (int iter = 0; iter < n_iterations; iter++)
+    const size_t totalPairs = detectedPoints.size() * (detectedPoints.size() - 1) / 2;
+    const size_t pairBudget = n_iterations > 0 ? std::min(static_cast<size_t>(n_iterations), totalPairs) : totalPairs;
+    size_t examinedPairs = 0;
+    // Enumerate every unordered pair once, by increasing index gap so a
+    // positive cap still spreads the budget across all detections.
+    for (size_t pointGap = 1; pointGap < detectedPoints.size() && examinedPairs < pairBudget; ++pointGap)
     {
-        int id1 = distribution(generator);
-        int id2 = distribution(generator);
-
-        std::vector<std::pair<Point3D, Point2D>> candidates;
-        candidates.push_back(std::make_pair(_soccerPitch3D.getPoint3D(detectedPoints.at(id1).first), detectedPoints.at(id1).second[0]));
-        candidates.push_back(std::make_pair(_soccerPitch3D.getPoint3D(detectedPoints.at(id2).first), detectedPoints.at(id2).second[0]));
-
-        double focal_length = estimateFocalLengthFromPositionAndTwoPoints(candidates, _tripodCenter);
-        if (focal_length == 1)
+        for (size_t id1 = 0; id1 + pointGap < detectedPoints.size() && examinedPairs < pairBudget; ++id1)
         {
-            focal_length = _camera.getFocalLength();
-        }
-
-        double pan;
-        double tilt;
-        std::tie(pan, tilt) = this->estimatePanTilt(candidates, focal_length, _tripodCenter, resolution.width, resolution.height);
-
-        Camera hypothesis;
-        hypothesis.setPanTiltRoll(Vector3x1(pan, tilt, 0.))
-            .setPosition(Vector3x1(_tripodCenter.x(), _tripodCenter.y(), _tripodCenter.z()))
-            .setPrincipalPoint(_camera.getPrincipalPoint())
-            .setFocalLength(focal_length);
-
-        double currentReprojectionError;
-        std::tie(currentReprojectionError, inlierError) = this->evaluateReprojectionError(detectedPoints, threshold, outInliers, hypothesis);
-        int inliersCount = std::count(outInliers.begin(), outInliers.end(), true);
-
-        if (currentReprojectionError < bestError)
-        {
-            bestError = currentReprojectionError;
-            bestCamera = hypothesis;
-        }
-
-        if ((inliersCount > 0.5 * detectedPoints.size() && inliersCount > 3 && inlierError < bestError))
-        {
-
-            std::vector<std::pair<Point3D, Point2D>> inliers;
-            for (int i = 0; i < outInliers.size(); i++)
+            const size_t id2 = id1 + pointGap;
+            ++examinedPairs;
+            if (detectedPoints[id1].second.empty() || detectedPoints[id2].second.empty())
             {
-                if (outInliers[i])
+                continue;
+            }
+
+            std::vector<std::pair<Point3D, Point2D>> candidates;
+            candidates.push_back(std::make_pair(_soccerPitch3D.getPoint3D(detectedPoints[id1].first), detectedPoints[id1].second[0]));
+            candidates.push_back(std::make_pair(_soccerPitch3D.getPoint3D(detectedPoints[id2].first), detectedPoints[id2].second[0]));
+
+            const std::vector<double> focalLengths = estimateFocalLengthsFromPositionAndTwoPoints(candidates, _tripodCenter, principalPoint, resolution);
+            for (const double focalLength : focalLengths)
+            {
+                double pan;
+                double tilt;
+                std::tie(pan, tilt) = this->estimatePanTilt(candidates, focalLength, _tripodCenter, resolution.width, resolution.height);
+                if (!std::isfinite(pan) || !std::isfinite(tilt))
                 {
-                    inliers.push_back(std::make_pair(_soccerPitch3D.getPoint3D(detectedPoints.at(i).first), detectedPoints.at(id1).second[0]));
+                    continue;
+                }
+
+                // Start from the current camera so resolution and distortion carry over.
+                Camera hypothesis = _camera;
+                hypothesis.setPanTiltRoll(Vector3x1(pan, tilt, 0.))
+                    .setPosition(Vector3x1(_tripodCenter.x(), _tripodCenter.y(), _tripodCenter.z()))
+                    .setFocalLength(focalLength);
+
+                HypothesisEvaluation hypothesisEvaluation;
+                hypothesisEvaluation.reprojection = evaluateReprojections(_soccerPitch3D, detectedPoints, threshold, outInliers, hypothesis);
+                hypothesisEvaluation.firstPointId = id1;
+                hypothesisEvaluation.secondPointId = id2;
+                if (hypothesisEvaluation.reprojection.validCount < 2)
+                {
+                    continue;
+                }
+
+                Camera selectedCamera = hypothesis;
+                HypothesisEvaluation selectedEvaluation = hypothesisEvaluation;
+
+                if (hypothesisEvaluation.reprojection.inlierCount > 0.5 * detectedPoints.size() && hypothesisEvaluation.reprojection.inlierCount > 3)
+                {
+                    std::vector<std::pair<Point3D, Point2D>> inliers;
+                    for (size_t pointIndex = 0; pointIndex < outInliers.size(); ++pointIndex)
+                    {
+                        if (!outInliers[pointIndex])
+                        {
+                            continue;
+                        }
+
+                        Point2D projectedPoint;
+                        Point2D closestObservation;
+                        double closestDistance;
+                        const Point3D worldPoint = _soccerPitch3D.getPoint3D(detectedPoints[pointIndex].first);
+                        if (hypothesis.project(worldPoint, projectedPoint, true) && isFinite(projectedPoint) &&
+                            findClosestFiniteObservation(projectedPoint, detectedPoints[pointIndex].second, closestObservation, closestDistance))
+                        {
+                            inliers.push_back(std::make_pair(worldPoint, closestObservation));
+                        }
+                    }
+
+                    if (inliers.size() >= 2)
+                    {
+                        double guidedPan;
+                        double guidedTilt;
+                        std::tie(guidedPan, guidedTilt) = this->estimatePanTilt(inliers, focalLength, _tripodCenter, resolution.width, resolution.height);
+                        if (std::isfinite(guidedPan) && std::isfinite(guidedTilt))
+                        {
+                            Camera guidedHypothesis = _camera;
+                            guidedHypothesis.setPanTiltRoll(Vector3x1(guidedPan, guidedTilt, 0.))
+                                .setPosition(Vector3x1(_tripodCenter.x(), _tripodCenter.y(), _tripodCenter.z()))
+                                .setFocalLength(focalLength);
+
+                            HypothesisEvaluation guidedEvaluation;
+                            guidedEvaluation.reprojection = evaluateReprojections(_soccerPitch3D, detectedPoints, threshold, outInliers, guidedHypothesis);
+                            guidedEvaluation.firstPointId = id1;
+                            guidedEvaluation.secondPointId = id2;
+
+                            if (guidedEvaluation.reprojection.validCount >= 2 && isBetterHypothesis(guidedEvaluation, hypothesisEvaluation))
+                            {
+                                selectedCamera = guidedHypothesis;
+                                selectedEvaluation = guidedEvaluation;
+                            }
+                        }
+                    }
+                }
+
+                if (isBetterHypothesis(selectedEvaluation, bestEvaluation))
+                {
+                    bestEvaluation = selectedEvaluation;
+                    bestCamera = selectedCamera;
                 }
             }
-            std::tie(pan, tilt) = this->estimatePanTilt(inliers, focal_length, _tripodCenter, resolution.width, resolution.height);
-
-            Camera guidedHypothesis;
-            guidedHypothesis.setPanTiltRoll(Vector3x1(pan, tilt, 0.))
-                .setPosition(Vector3x1(_tripodCenter.x(), _tripodCenter.y(), _tripodCenter.z()))
-                .setPrincipalPoint(_camera.getPrincipalPoint())
-                .setFocalLength(focal_length);
-            double guidedReprojectionError;
-            double guidedInlierError;
-            std::tie(guidedReprojectionError, guidedInlierError) = this->evaluateReprojectionError(detectedPoints, threshold, outInliers, guidedHypothesis);
-            if (guidedInlierError < inlierError)
-            {
-                bestError = guidedInlierError;
-                bestCamera = guidedHypothesis;
-            }
-            else
-            {
-                bestError = inlierError;
-                bestCamera = hypothesis;
-            }
-
-            std::cout << hypothesis.toJSONString() << std::endl;
-        }
-
-        if (currentReprojectionError < threshold)
-        {
-            break;
         }
     }
     _camera = bestCamera;

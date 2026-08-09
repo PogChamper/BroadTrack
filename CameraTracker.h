@@ -41,6 +41,10 @@ class CameraTracker
 {
 
 public:
+    // Confidence below which recovery runs and above which tracking is
+    // considered regained.
+    static constexpr double REINIT_SCORE_THRESHOLD = 0.5;
+
     CameraTracker();
 
     std::tuple<double, Camera> update(const cv::Mat &semLinesMask,
@@ -50,7 +54,9 @@ public:
                                       bool lensDistortion = true,
                                       int cauchyParameter = 10);
 
-    void reinit(const std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> &detectedPoints, int threshold = 2, int n_iterations = 20);
+    // A negative n_iterations evaluates every unique point pair, a positive one
+    // caps the number of pairs examined.
+    void reinit(const std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> &detectedPoints, int threshold = 2, int n_iterations = -1);
 
     std::tuple<double, double> evaluateReprojectionError(const std::vector<std::pair<SoccerPitch3D::PointID, std::vector<Point2D>>> &points, int threshold, std::vector<bool> &outInliers, const Camera &camera);
 
