@@ -32,7 +32,6 @@
 #include <limits>
 #include <numeric>
 
-const double MASK_TO_HD_FACTOR = 2.0;
 
 namespace
 {
@@ -382,8 +381,10 @@ double CameraTracker::evaluate(const cv::Mat &semLinesMask)
     rawLines.setTo(255, rawLines >= 150);
     rawLines.setTo(0, rawLines < 150);
     cv::resize(rawLines, rawLines, cv::Size(960, 540), 1);
+    // Scale the projection from camera pixels to the 960x540 score mask.
+    const cv::Size resolution = _camera.getPixelResolution();
     Matrix3x3 H = _camera.getGroundPlaneHomography();
-    H = Matrix3x3(1.0 / MASK_TO_HD_FACTOR, 0, 0, 0, 1.0 / MASK_TO_HD_FACTOR, 0, 0, 0, 1).multiply(H);
+    H = Matrix3x3(960.0 / resolution.width, 0, 0, 0, 540.0 / resolution.height, 0, 0, 0, 1).multiply(H);
     double outScore = LineIoUScore(rawLines).evaluateFast(
         H,
         _soccerPitch3D.getLength(),

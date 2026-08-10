@@ -49,7 +49,6 @@ namespace po = boost::program_options;
 #include "rapidjson/istreamwrapper.h"
 
 using namespace rapidjson;
-const double MASK_TO_HD = 2.0;
 
 std::vector<cv::Rect2d> loadHumanBboxes(std::string full_human_bboxes_path)
 {

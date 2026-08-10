@@ -69,7 +69,7 @@ now stay in native mask coordinates between frames, the mean shift keeps
 subpixel centroids, and a single pixel-center mapping with separate x and y
 scales converts them straight to HD (seeds at
 [PointExtractor.cpp#L149](PointExtractor.cpp#L149), mapping at
-[CameraTracker.cpp#L188](CameraTracker.cpp#L188)).
+[CameraTracker.cpp#L187](CameraTracker.cpp#L187)).
 
 ### Downsampling did not match TVCalib
 
@@ -113,8 +113,8 @@ field-of-view range, ranks hypotheses consistently, matches each inlier to its
 closest observation, and modifies a copy of the current camera. The two
 hard-coded confidence thresholds (0.3 to trigger recovery, 0.5 to accept)
 became a single symmetric 0.5 (focal roots at
-[CameraTracker.cpp#L488](CameraTracker.cpp#L488), pair enumeration at
-[#L658](CameraTracker.cpp#L658), threshold at
+[CameraTracker.cpp#L489](CameraTracker.cpp#L489), pair enumeration at
+[#L659](CameraTracker.cpp#L659), threshold at
 [CameraTracker.h#L46](CameraTracker.h#L46)).
 
 ### Runs were not repeatable
@@ -125,6 +125,18 @@ points apart on a sequence. The sampler is now seeded with 0 each frame,
 which removes that spread. Small run-to-run differences can still come from
 GPU inference itself; in our reruns they moved the full-split aggregate by
 about 0.01 JaC ([PointExtractor.cpp#L57](PointExtractor.cpp#L57)).
+
+### The score assumed 1080p input
+
+The confidence score projects the pitch model onto a 960x540 copy of the
+line mask, and the projection was scaled by a hard-coded factor of two,
+which is only correct when the input is 1920x1080. At any other resolution
+the score came out near zero no matter how good the pose was, so the
+tracker declared itself lost on every frame and never recovered. The scale
+now comes from the actual camera resolution
+([CameraTracker.cpp#L384](CameraTracker.cpp#L384)). At 1080p the factor is
+exactly the same 0.5, so the SoccerNet results are unchanged; on a 720p
+clip this fix takes the tracker from zero locked frames to 99%.
 
 ## How the fixes were tested
 
