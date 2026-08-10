@@ -14,6 +14,12 @@ close to the paper:
 There are no switches to set. Build the image, prepare the inputs, run,
 evaluate. See "Running it" at the bottom.
 
+The fixed tracker also just works on ordinary broadcast footage. A 42
+second Europa League clip, tracked with the default main-camera prior and
+rendered with repro/visualize.py:
+
+![Pitch tracking on a broadcast clip](images/nott-tracking.gif)
+
 ## The fixes
 
 ### The networks received BGR images
