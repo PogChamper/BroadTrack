@@ -268,8 +268,25 @@ python3 repro/visualize.py --frames frames --cameras broadtrack.json --out clip.
 X/Y/Z is the standard main-camera prior from the tripod table in the
 README. If the clip
 pans widely, scripts/compute_tripod.py can estimate the actual tripod from
-this first result for a second, tighter run with --t. Player boxes (--b)
-help but are optional for casual clips.
+this first result for a second, tighter run with --t.
+
+### Player boxes
+
+Flow points that land on players drag the camera estimate, so the binary
+accepts per-frame people boxes via --b. Any person detector can produce
+them: the directory holds one JSON per frame, named after it (000001.json
+for 000001.jpg), and a missing file simply means no boxes on that frame:
+
+```json
+{"bboxes": [[x1, y1, x2, y2, confidence], ...]}
+```
+
+Coordinates are absolute pixels of the frame, left/top/right/bottom. Only
+the first four numbers are read (the confidence is ignored), and the
+binary pads every box by 100 pixels on each side before dropping flow
+points inside, so tight detector boxes are fine. prepare_soccernet.py
+writes exactly this format from the GameState annotations; for casual
+clips the flag is optional.
 
 The evaluator and the visualizer need numpy and the sn_calibration_baseline
 package from the SoccerNet calibration repository on the Python path.
