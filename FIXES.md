@@ -238,5 +238,38 @@ python3 repro/evaluate_soccernet.py \
   --json-out /data/broadtrack-results/metrics.json
 ```
 
-The evaluator needs numpy and the sn_calibration_baseline package from the
-SoccerNet calibration repository on the Python path.
+### Watching the result
+
+Any run can be rendered as stills or video: the pitch model drawn over the
+frames, the frames warped onto a top-down pitch template, or both side by
+side (the default). Point the script at the frames and the camera JSON:
+
+```bash
+python3 repro/visualize.py \
+  --frames /data/SoccerNetGS/test/SNGS-116/img1 \
+  --cameras /data/broadtrack-results/SNGS-116/broadtrack.json \
+  --out sngs116.mp4
+```
+
+`--mode overlay` or `--mode topdown` picks one view, `--out` a directory
+writes PNGs instead of a video, `--start`/`--count` select a frame range.
+
+The same works for your own footage at any resolution. Cut a continuous
+single-camera segment (no replays or camera switches), split it into
+frames, run the binary, then visualize:
+
+```bash
+ffmpeg -i clip.mp4 -q:v 1 frames/%06d.jpg
+docker run --rm --gpus=all -v "$PWD":/w broadtrack \
+  broadtrack --f /w/frames --o /w/broadtrack.json --X 0 --Y 55 --Z -12
+python3 repro/visualize.py --frames frames --cameras broadtrack.json --out clip.mp4
+```
+
+X/Y/Z is the standard main-camera prior from the tripod table in the
+README. If the clip
+pans widely, scripts/compute_tripod.py can estimate the actual tripod from
+this first result for a second, tighter run with --t. Player boxes (--b)
+help but are optional for casual clips.
+
+The evaluator and the visualizer need numpy and the sn_calibration_baseline
+package from the SoccerNet calibration repository on the Python path.
